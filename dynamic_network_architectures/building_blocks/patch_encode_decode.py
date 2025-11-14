@@ -1,8 +1,15 @@
-from typing import Tuple
+from typing import Literal, Tuple
 import torch
 from torch import nn
 from dynamic_network_architectures.building_blocks.helper import convert_dim_to_conv_op
 import numpy as np
+
+from dynamic_network_architectures.building_blocks.residual import BasicBlockD, BottleneckD, StackedResidualBlocks
+from dynamic_network_architectures.building_blocks.simple_conv_blocks import StackedConvBlocks
+
+
+block_type = Literal["basic", "bottleneck"]
+block_style = Literal["residual", "conv"]
 
 
 class LayerNormNd(nn.Module):
@@ -17,10 +24,7 @@ class LayerNormNd(nn.Module):
         s = (x - u).pow(2).mean(1, keepdim=True)
         x = (x - u) / torch.sqrt(s + self.eps)
         idx = (None, slice(None), *([None] * (x.ndim - 2)))
-        x = (
-            self.weight[idx] * x
-            + self.bias[idx]
-        )
+        x = self.weight[idx] * x + self.bias[idx]
         return x
 
 
@@ -106,3 +110,153 @@ class PatchDecode(nn.Module):
         Expects input of shape (B, embed_dim, px, py, pz)! This will require you to reshape the output of your transformer!
         """
         return self.decode(x)
+
+
+class PatchEmbed_deeper(nn.Module):
+    """ResNet-style patch embedding with progressive downsampling"""
+
+    def __init__(
+        self,
+        input_channels: int = 3,
+        embed_dim: int = 864,
+        base_features: int = 32,
+        depth_per_level: tuple[int, ...] = (1, 1, 1),
+        embed_proj_3x3x3: bool = False,
+        embed_block_type: block_type = "basic",
+        embed_block_style: block_style = "residual",  # "basic" or "bottleneck" (if "residual" style)
+    ) -> None:
+        """
+        Iterative, convolutional patch embedding layer.
+
+        Args:
+            input_channels (int): Number of input image channels.
+            embed_dim (int): Patch embedding dimension.
+            base_features (int): Number of base features for the first stage.
+            depth_per_level (tuple[int, ...]): Number of blocks per stage/level.
+            embed_proj_3x3x3 (bool): Whether to use a 3x3x3 convolution for the final projection to embed_dim.
+            embed_block_type (residual_block_style): Type of residual block to use if embed_block_style is 'residual'. Either 'basic' or 'bottleneck'.
+            embed_block_style (block_style): Style of blocks to use in the embedding stages. Either 'residual' or 'conv'.
+
+        """
+
+        super().__init__()
+
+        norm_op = nn.InstanceNorm3d
+        block = BottleneckD if embed_block_type == "bottleneck" else BasicBlockD
+        nonlin = nn.LeakyReLU if embed_block_type == "bottleneck" else nn.ReLU
+        norm_op_kwargs = {"eps": 1e-5, "affine": True}
+        nonlin_kwargs = {"inplace": True}
+
+        # Stem convolution (initial feature extraction)
+        if embed_block_type == "bottleneck":
+            bottleneck_channels = base_features // 4
+        else:
+            bottleneck_channels = None
+
+        if embed_block_style == "residual":
+            self.stem = StackedResidualBlocks(
+                1,
+                nn.Conv3d,
+                input_channels,
+                base_features,
+                [3, 3, 3],
+                1,
+                True,
+                norm_op,
+                norm_op_kwargs,
+                None,
+                None,
+                nonlin,
+                nonlin_kwargs,
+                block=block,
+            )
+        elif embed_block_style == "conv":
+            self.stem = StackedConvBlocks(
+                1,
+                nn.Conv3d,
+                input_channels,
+                base_features,
+                [3, 3, 3],
+                1,
+                True,
+                norm_op,
+                norm_op_kwargs,
+                None,
+                None,
+                nonlin,
+                nonlin_kwargs,
+            )
+        else:
+            raise ValueError(f"Unknown embed_block_style: {embed_block_style}. Must be 'residual' or 'conv'.")
+
+        # Calculate total downsampling needed
+        levels_needed = len(depth_per_level)
+
+        # Build encoder stages
+        self.stages = nn.ModuleList()
+        input_channels = base_features
+
+        for i in range(levels_needed):
+            # First block in each stage handles downsampling and channel increase
+            stride = 2
+            output_channels = base_features * (2**i)
+            if embed_block_style == "residual":
+                if embed_block_type == "bottleneck":
+                    bottleneck_channels = output_channels // 4
+                else:
+                    bottleneck_channels = None
+                stage = StackedResidualBlocks(
+                    n_blocks=depth_per_level[i],
+                    conv_op=nn.Conv3d,
+                    input_channels=input_channels,
+                    output_channels=output_channels,
+                    kernel_size=3,
+                    initial_stride=stride,
+                    conv_bias=False,
+                    norm_op=norm_op,
+                    norm_op_kwargs=norm_op_kwargs,
+                    dropout_op=None,
+                    dropout_op_kwargs=None,
+                    nonlin=nonlin,
+                    nonlin_kwargs=nonlin_kwargs,
+                    block=block,
+                    bottleneck_channels=bottleneck_channels,
+                )
+            elif embed_block_style == "conv":
+                stage = StackedConvBlocks(
+                    num_convs=depth_per_level[i],
+                    conv_op=nn.Conv3d,
+                    input_channels=input_channels,
+                    output_channels=output_channels,
+                    kernel_size=3,
+                    initial_stride=stride,
+                    conv_bias=False,
+                    norm_op=norm_op,
+                    norm_op_kwargs=norm_op_kwargs,
+                    dropout_op=None,
+                    dropout_op_kwargs=None,
+                    nonlin=nonlin,
+                    nonlin_kwargs=nonlin_kwargs,
+                )
+            self.stages.append(stage)
+            input_channels = output_channels
+
+        # Global average pooling or final conv to get to embed_dim
+        final_proj_kernel = [3, 3, 3] if embed_proj_3x3x3 else [1, 1, 1]
+        final_pad = [1, 1, 1] if embed_proj_3x3x3 else [0, 0, 0]
+        self.final_proj = nn.Conv3d(
+            input_channels, embed_dim, kernel_size=final_proj_kernel, stride=[1, 1, 1], padding=final_pad
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Stem
+        x = self.stem(x)
+
+        # Progressive encoding through residual stages
+        for stage in self.stages:
+            x = stage(x)
+
+        # Final projection to embedding tokens
+        x = self.final_proj(x)
+
+        return x
