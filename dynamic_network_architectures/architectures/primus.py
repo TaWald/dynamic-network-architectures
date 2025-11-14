@@ -305,10 +305,10 @@ class PrimusV2X(PrimusV2):
         conf = _PRIMUS_CONFIGS[config_name]
         super().__init__(
             input_channels=input_channels,
-            output_channels=output_channels,
+            num_classes=output_channels,
             embed_dim=conf["embed_dim"],
             eva_depth=conf["eva_depth"],
-            eva_num_heads=conf["eva_numheads"],
+            eva_numheads=conf["eva_numheads"],
             patch_embed_size=patch_embed_size,
             input_shape=input_shape,
             drop_path_rate=drop_path_rate,
