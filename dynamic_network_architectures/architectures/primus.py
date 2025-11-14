@@ -237,7 +237,56 @@ class PrimusX(Primus):
         )
 
 
-class PrimusV2X(PrimusX):
+class PrimusV2(Primus):
+
+    def __init__(
+        self,
+        input_channels: int,
+        embed_dim: int,
+        patch_embed_size: Tuple[int, ...],
+        num_classes: int,
+        eva_depth: int,
+        eva_numheads: int,
+        input_shape: Tuple[int, ...] = None,
+        drop_path_rate=0,  # drops computations (multihead attention, mlp), Implementation of scaling might be useless here because this is not batch normed
+        patch_drop_rate: float = 0.0,  # drops input patches, may be used for MAE style pretraining
+        rope_impl=RotaryEmbeddingCat,
+        rope_kwargs=None,
+        init_values=None,
+        scale_attn_inner=False,
+    ):
+        super().__init__(
+            input_channels=input_channels,
+            embed_dim=embed_dim,
+            patch_embed_size=patch_embed_size,
+            num_classes=num_classes,
+            eva_depth=eva_depth,
+            eva_numheads=eva_numheads,
+            input_shape=input_shape,
+            drop_path_rate=drop_path_rate,
+            patch_drop_rate=patch_drop_rate,
+            rope_impl=rope_impl,
+            rope_kwargs=rope_kwargs,
+            init_values=init_values,
+            scale_attn_inner=scale_attn_inner,
+        )
+        self.keys_to_in_proj = (
+            "down_projection.stem.blocks.0.conv1.conv",
+            "down_projection.stem.blocks.0.conv1.all_modules.0",
+        )
+        self.down_projection = PatchEmbed_deeper(
+            input_channels=input_channels,
+            embed_dim=embed_dim,
+            base_features=32,
+            depth_per_level=(1, 1, 1),
+            embed_proj_3x3x3=False,
+            embed_block_style="residual",
+            embed_block_type="basic",  # "basic" or "bottleneck" (if "residual" style)
+        )
+        self.down_projection.apply(InitWeights_He(1e-2))
+
+
+class PrimusV2X(PrimusV2):
 
     def __init__(
         self,
@@ -253,10 +302,13 @@ class PrimusV2X(PrimusX):
         init_values=None,
         scale_attn_inner=False,
     ):
+        conf = _PRIMUS_CONFIGS[config_name]
         super().__init__(
             input_channels=input_channels,
             output_channels=output_channels,
-            config_name=config_name,
+            embed_dim=conf["embed_dim"],
+            eva_depth=conf["eva_depth"],
+            eva_num_heads=conf["eva_numheads"],
             patch_embed_size=patch_embed_size,
             input_shape=input_shape,
             drop_path_rate=drop_path_rate,
@@ -266,20 +318,6 @@ class PrimusV2X(PrimusX):
             init_values=init_values,
             scale_attn_inner=scale_attn_inner,
         )
-        self.keys_to_in_proj = (
-            "down_projection.stem.blocks.0.conv1.conv",
-            "down_projection.stem.blocks.0.conv1.all_modules.0",
-        )
-        self.down_projection = PatchEmbed_deeper(
-            input_channels=input_channels,
-            embed_dim=self.embed_dim,
-            base_features=32,
-            depth_per_level=(1, 1, 1),
-            embed_proj_3x3x3=False,
-            embed_block_style="residual",
-            embed_block_type="basic",  # "basic" or "bottleneck" (if "residual" style)
-        )
-        self.down_projection.apply(InitWeights_He(1e-2))
 
 
 class PrimusS(PrimusX):
